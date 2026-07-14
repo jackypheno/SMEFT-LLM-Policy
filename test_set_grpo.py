@@ -10,7 +10,7 @@ candidate subsets, compute group-relative advantages, and apply a clipped
 policy-ratio update.
 
 Important:
-- The reward is evaluated ONLY on the complete subset.  It does not need
+- The reward is still evaluated ONLY on the complete subset.  It does not need
   to decompose into individual operator rewards.
 - A shared latent context z is sampled once per candidate subset and fed to all
   operator heads.  Conditional on z the bits are Bernoulli, but marginalizing
@@ -42,13 +42,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # OPERATOR VOCABULARY
 # ============================================================
 
-vocab = Path("smeft_rl/vocab_0f2f.txt").read_text().split()
-SPECIAL = {"PAD", "START", "END", "UNK"}
+vocab = Path("vocab_0f2f.txt").read_text().split()
 
-# The policy acts on operators only.
-OPS = [tok for tok in vocab if tok not in SPECIAL]
-N_OPS = len(OPS)
-op_to_idx = {op: i for i, op in enumerate(OPS)}
+N_OPS = len(vocab)
+op_to_idx = {op: i for i, op in enumerate(vocab)}
 
 print(f"Device: {device}")
 print(f"Number of candidate operators: {N_OPS}")
@@ -127,7 +124,7 @@ class SMEFTSetPolicy(nn.Module):
 model = SMEFTSetPolicy(N_OPS, d_model = 32, nhead = 1, nlayers = 1, dim_feedforward=32, latent_dim = 8).to(device)
 
 # Initialization to avoid all the probabilities to be close to 0.5
-target_initial_size = 3
+target_initial_size = 4
 p0 = target_initial_size / N_OPS
 initial_bias = np.log(p0 / (1.0 - p0))
 nn.init.constant_(model.selection_head[-1].bias, initial_bias)
@@ -136,21 +133,21 @@ nn.init.constant_(model.selection_head[-1].bias, initial_bias)
 # HYPERPARAMETERS
 # ============================================================
 
-B = 50                  # number of GRPO groups
-G = 10                   # candidate subsets per group
-N_BATCHES = 50
-N_UPDATE_STEPS = 20
+B = 32                   # number of GRPO groups
+G = 16                   # candidate subsets per group
+N_BATCHES = 200
+N_UPDATE_STEPS = 10
 
-EPS = 0.2
+EPS = 0.1
 ADV_STD_MIN = 0.1
-LR_PEAK = 1e-4
+LR_PEAK = 0.3e-4
 
 LATENT_DIM = model.latent_dim
 
 # Exploration: mix policy samples with uniformly random sparse subsets.
-EPSILON_START = 0.8
-EPSILON_END = 0.05
-EPSILON_DECAY = 0.88
+EPSILON_START = 0.5
+EPSILON_END = 0.15
+EPSILON_DECAY = 0.97
 RANDOM_MAX_OPS = 4
 
 opt = torch.optim.AdamW(model.parameters(), lr=LR_PEAK)
@@ -179,13 +176,21 @@ OP_SCORES = {
 _sorted_scores = sorted(OP_SCORES.values(), reverse=True)
 MAX_RAW_SCORE = sum(_sorted_scores[:3])
 JUNK_PENALTY = 0.10
-LENGTH_PENALTY = 0.15
+LENGTH_PENALTY = 0.10
 FREE_OPS = 3
 
 
 def _compute_reward(ops):
     if len(ops) == 0:
         return -0.5
+    
+    # Hardcoded test combine 4 ops with individual reward 0 but together give 1
+    good_set = ["phiud_32", "ll_2233", "phiq1_12", "phiWtildeB"]
+    n = 0
+    for op in ops:
+        if op in good_set: n+=1
+    if n > 1: return 0.7 + 0.15*(n-2) - JUNK_PENALTY*(len(ops)-n)
+
 
     known_ops = set(OP_SCORES)
     good_ops = [op for op in ops if op in known_ops]
@@ -231,10 +236,8 @@ def get_reward(ops):
         best_reward_so_far = r
         first_best_found = len(reward_cache)
         best_ops_so_far = list(ops)
-        print(
-            f"\n*** NEW BEST: reward={r:.4f} ops={ops} "
-            f"at unique eval #{first_best_found} ***"
-        )
+        print(f"\n*** NEW BEST: reward={r:.4f} ops={ops} "
+            f"at unique eval #{first_best_found} ***")
 
     return r
 
@@ -255,12 +258,24 @@ def sample_policy(policy, n):
     logits = policy(z)
     dist = torch.distributions.Bernoulli(logits=logits)
     actions = dist.sample()
+    
+    # Avoid empty set
+    empty = actions.sum(dim=1) == 0
+    if empty.any():
+        empty_idx = torch.where(empty)[0]
+    
+        # Sample one operator according to the policy's relative probabilities
+        probs = torch.sigmoid(logits[empty_idx])
+        chosen = torch.multinomial(probs, num_samples=1).squeeze(1)
+    
+        actions[empty_idx, chosen] = 1.0
 
     # Do NOT top-k/project actions here unless you also model that transformed
     # distribution. Prefer a size penalty in the reward.
     old_logp = dist.log_prob(actions).sum(dim=-1)
 
     return actions, z, old_logp
+
 
 
 # ============================================================
@@ -330,7 +345,7 @@ for batch_idx in range(N_BATCHES):
             rewards = []
             for j in range(G):
                 # Action to operators
-                ops = [OPS[i] for i in torch.nonzero(actions[j] > 0.5, as_tuple=False).flatten()]
+                ops = [vocab[i] for i in torch.nonzero(actions[j] > 0.5, as_tuple=False).flatten()]
                 r = get_reward(ops)
                 rewards.append(r)
                 theory_archive.append({"ops": ops, "reward": r, "source": "policy"})
@@ -355,7 +370,7 @@ for batch_idx in range(N_BATCHES):
                     rand_actions[b, torch.as_tensor(ids, dtype=torch.long, device=device)] = 1.0
 
                 # Action to operators
-                rand_ops = [OPS[i] for i in torch.nonzero(rand_actions[0] > 0.5, as_tuple=False).flatten()]
+                rand_ops = [vocab[i] for i in torch.nonzero(rand_actions[0] > 0.5, as_tuple=False).flatten()]
                 rand_r = get_reward(rand_ops)
                 theory_archive.append({
                     "ops": rand_ops,
@@ -406,7 +421,7 @@ for batch_idx in range(N_BATCHES):
     # --------------------------------------------------------
     # STEP 3: diagnostics
     # --------------------------------------------------------
-    if batch_idx % 5 == 0:
+    if batch_idx % (N_BATCHES//10) == 0:
         all_batch_rewards = torch.cat([g["rewards"] for g in groups])
         all_batch_adv = torch.cat([g["advantages"] for g in groups])
 
@@ -453,7 +468,6 @@ for rank, (ops, reward) in enumerate(
     sorted(best.items(), key=lambda x: x[1], reverse=True)[:15], start=1
 ):
     print(f"{rank:>2}. reward={reward:.4f}  ops={list(ops)}")
-
 
 print_search_efficiency(N_BATCHES - 1)
 print("Training complete.")
